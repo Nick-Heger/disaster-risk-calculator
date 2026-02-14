@@ -117,47 +117,73 @@ async function fetchNRIData(countyFips) {
 }
 
 // ─── ZIP → COUNTY FIPS ──────────────────────────────────────────────
-// Use the free HUD USPS ZIP Crosswalk concept, but since that requires a key,
-// we'll use a bundled approach: fetch from a free geocoding service
+// Uses multiple free APIs with fallback for reliability
 
 async function zipToCountyFips(zip) {
-  // Approach: Use the Census Bureau geocoder (free, no key)
-  // First try the Census Bureau's batch geocoder
-  const url = `https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress?address=${zip}&benchmark=Public_AR_Current&vintage=Current_Current&format=json`;
+  // Try multiple approaches in order of reliability
   
-  const response = await fetch(url);
-  if (!response.ok) throw new Error("Geocoding service unavailable");
-  const data = await response.json();
-  
-  const matches = data?.result?.addressMatches;
-  if (!matches || matches.length === 0) {
-    throw new Error("Could not find location for this ZIP code. Please check and try again.");
+  // Approach 1: Zippopotam.us (free, no key, very reliable) → gives lat/lng + state
+  // Then FCC Area API → gives county FIPS from lat/lng
+  try {
+    const zipRes = await fetch(`https://api.zippopotam.us/us/${zip}`);
+    if (zipRes.ok) {
+      const zipData = await zipRes.json();
+      const place = zipData.places?.[0];
+      if (place) {
+        const lat = parseFloat(place.latitude);
+        const lng = parseFloat(place.longitude);
+        const stateName = place.state;
+        
+        // Use FCC Area API to get county FIPS from lat/lng
+        const fccRes = await fetch(`https://geo.fcc.gov/api/census/area?lat=${lat}&lon=${lng}&format=json`);
+        if (fccRes.ok) {
+          const fccData = await fccRes.json();
+          const result = fccData?.results?.[0];
+          if (result?.county_fips) {
+            return {
+              fips: result.county_fips,
+              countyName: result.county_name,
+              stateName: stateName,
+              lat,
+              lng,
+              matchedAddress: `${place["place name"]}, ${place["state abbreviation"]} ${zip}`,
+            };
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // Fall through to next approach
   }
-  
-  const match = matches[0];
-  const geographies = match.geographies;
-  
-  // Get county FIPS from the geography data
-  const counties = geographies?.Counties;
-  if (!counties || counties.length === 0) {
-    throw new Error("Could not determine county for this ZIP code.");
+
+  // Approach 2: Census Bureau geocoder (free, no key, but sometimes unreliable)
+  try {
+    const url = `https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress?address=${zip}&benchmark=Public_AR_Current&vintage=Current_Current&format=json`;
+    const response = await fetch(url);
+    if (response.ok) {
+      const data = await response.json();
+      const matches = data?.result?.addressMatches;
+      if (matches && matches.length > 0) {
+        const match = matches[0];
+        const counties = match.geographies?.Counties;
+        if (counties && counties.length > 0) {
+          const county = counties[0];
+          return {
+            fips: county.STATE + county.COUNTY,
+            countyName: county.NAME,
+            stateName: match.addressComponents?.state,
+            lat: parseFloat(match.coordinates.y),
+            lng: parseFloat(match.coordinates.x),
+            matchedAddress: match.matchedAddress,
+          };
+        }
+      }
+    }
+  } catch (e) {
+    // Fall through to error
   }
-  
-  const county = counties[0];
-  const stateFips = county.STATE;
-  const countyFips = county.COUNTY;
-  const fullFips = stateFips + countyFips;
-  const countyName = county.NAME;
-  const stateName = match.addressComponents?.state || county.STATE;
-  
-  return {
-    fips: fullFips,
-    countyName,
-    stateName: match.addressComponents?.state,
-    lat: parseFloat(match.coordinates.y),
-    lng: parseFloat(match.coordinates.x),
-    matchedAddress: match.matchedAddress,
-  };
+
+  throw new Error("Could not find location for this ZIP code. Please check and try again.");
 }
 
 // ─── COMPONENTS ──────────────────────────────────────────────────────
